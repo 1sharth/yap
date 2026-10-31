@@ -1,0 +1,13 @@
+[Unit]
+Description=Faster-Whisper Singleton GPU Service for Dictation
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/home/iro/.local/share/dictate-venv/bin/python /mnt/NewVolume/projects/yap/whisper_server.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

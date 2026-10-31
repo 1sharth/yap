@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Yap — Local Dictation & Conversations</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Sidebar: Sessions List -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">
+          <span class="brand-dot" id="engine-dot" title="Engine Status"></span>
+          <span class="brand-title">Yap</span>
+          <span class="badge" id="status-gpu">RTX 4080</span>
+        </div>
+        <button id="btn-new-session" class="btn btn-primary" title="Create a new conversation session">
+          + New
+        </button>
+      </div>
+
+      <div class="sidebar-search">
+        <input type="search" id="session-search" placeholder="Filter sessions..." aria-label="Search sessions">
+      </div>
+
+      <div class="sessions-list" id="sessions-list" role="navigation" aria-label="Sessions history">
+        <div class="loading-placeholder">Loading sessions...</div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="status-indicator">
+          <span class="status-dot ready"></span>
+          <span id="engine-status-text">Whisper resident ready</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content: Active Conversation -->
+    <main class="main-content">
+      <!-- Session Header -->
+      <header class="session-header" id="session-header" style="display: none;">
+        <div class="session-title-wrap">
+          <h1 id="session-title" class="session-title" contenteditable="true" spellcheck="false" title="Click to rename session">
+            Session Title
+          </h1>
+          <div class="session-meta">
+            <span id="session-date">Created Oct 31</span>
+            <span class="dot-sep">•</span>
+            <span id="session-stats">0 turns • 0.0s</span>
+            <span class="dot-sep">•</span>
+            <span id="session-client-badge" class="badge">web</span>
+          </div>
+        </div>
+
+        <div class="session-actions">
+          <button id="btn-copy-raw" class="btn btn-secondary" title="Copy full conversation text to clipboard">
+            Copy text
+          </button>
+          <button id="btn-export-md" class="btn btn-secondary" title="Download Obsidian Markdown note">
+            Export .md
+          </button>
+          <button id="btn-delete-session" class="btn btn-danger" title="Delete this session">
+            Delete
+          </button>
+        </div>
+      </header>
+
+      <!-- Turns Timeline -->
+      <section class="turns-container" id="turns-container">
+        <div class="empty-state" id="empty-state">
+          <h2>No transcriptions yet</h2>
+          <p>Press the record button below or hit <code>[ENTER]</code> in terminal (<code>yap</code>) to dictate.</p>
+        </div>
+      </section>
+
+      <!-- Bottom Recording Dock -->
+      <footer class="recording-dock">
+        <div class="dock-container">
+          <div class="dock-left">
+            <label class="toggle-wrap" title="Automatically copy new transcriptions to your clipboard">
+              <input type="checkbox" id="toggle-autocopy" checked>
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">Auto-copy</span>
+            </label>
+          </div>
+
+          <div class="dock-center">
+            <button id="btn-record" class="record-btn" aria-label="Toggle voice recording" title="Click to start / stop speaking">
+              <div class="record-icon"></div>
+            </button>
+            <div class="recording-info" id="recording-info">
+              <span class="record-status" id="record-status">Click to speak</span>
+              <span class="record-timer" id="record-timer">00:00</span>
+            </div>
+            <canvas id="audio-visualizer" class="visualizer-canvas" width="100" height="26"></canvas>
+          </div>
+
+          <div class="dock-right">
+            <span class="terminal-hint">Terminal: <code>yap</code> / <code>Meta+Y</code></span>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Accessible Modal Confirmation Dialog for Session Deletion -->
+  <dialog id="delete-dialog" class="modern-dialog" aria-labelledby="delete-dialog-title" closedby="any">
+    <div class="dialog-content">
+      <h2 id="delete-dialog-title">Delete Session?</h2>
+      <p id="delete-dialog-desc">This will permanently remove the session and its transcript history.</p>
+      
+      <label class="checkbox-label">
+        <input type="checkbox" id="delete-audio-checkbox" checked>
+        <span>Delete corresponding WAV recordings</span>
+      </label>
+
+      <form method="dialog" class="dialog-actions">
+        <button type="submit" value="cancel" class="btn btn-secondary" autofocus>Cancel</button>
+        <button type="button" id="btn-confirm-delete" class="btn btn-danger">Delete</button>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- Scripts -->
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/recorder.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

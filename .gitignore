@@ -1,0 +1,54 @@
+# Environment & Secret Credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+credentials.json
+token.json
+secrets.json
+
+# Audio Recordings (Private user voice clips)
+recordings/*.wav
+recordings/*.mp3
+recordings/*.webm
+recordings/*.ogg
+recordings/*.m4a
+!recordings/README.md
+!recordings/.gitkeep
+
+# SQLite Database & Write-Ahead Logs
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+yap.db*
+
+# Personal Dictation Logs & Scratchpad Traces
+thinking.txt
+*.log
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+dictate-venv/
+
+# IDE & OS Artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
