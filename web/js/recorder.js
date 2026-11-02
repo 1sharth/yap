@@ -68,11 +68,11 @@ class VoiceRecorder {
       }
     };
 
+    this.isRecording = true;
     // Audio Visualizer setup
     this._setupVisualizer();
 
     this.mediaRecorder.start(250); // Slice every 250ms
-    this.isRecording = true;
     this.startTime = Date.now();
 
     // Timer interval
@@ -124,7 +124,7 @@ class VoiceRecorder {
 
         for (let i = 0; i < bufferLength; i++) {
           const barHeight = (dataArray[i] / 255) * height;
-          this.canvasCtx.fillStyle = `rgba(99, 102, 241, ${0.4 + (dataArray[i] / 255) * 0.6})`;
+          this.canvasCtx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent-brand").trim();
           this.canvasCtx.fillRect(x, height - barHeight, barWidth - 1, barHeight);
           x += barWidth;
         }

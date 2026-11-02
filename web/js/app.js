@@ -68,6 +68,7 @@ document.addEventListener("DOMContentLoaded", () => {
     },
     async (blob) => {
       recordStatusEl.textContent = "Transcribing...";
+      btnRecord.disabled = true;
       btnRecord.classList.remove("recording");
       isRecording = false;
 
@@ -91,6 +92,7 @@ document.addEventListener("DOMContentLoaded", () => {
           }
 
           // Reload session details to display updated turns
+          btnRecord.disabled = false;
           await selectSession(currentSessionId, false);
           await loadSessionsList();
         } else {
@@ -100,6 +102,8 @@ document.addEventListener("DOMContentLoaded", () => {
         recordStatusEl.textContent = "Click to speak";
         recordTimerEl.textContent = "00:00";
         showToast(`Transcription error: ${err.message}`, "danger");
+      } finally {
+        btnRecord.disabled = false;
       }
     }
   );
@@ -107,6 +111,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // Health check
   async function checkServerHealth() {
     const health = await API.checkHealth();
+    document.getElementById("footer-engine-dot").className = health.status === "ready" ? "status-dot ready" : "status-dot";
     if (health.status === "ready") {
       engineDot.className = "status-dot ready";
       engineStatusText.textContent = `Whisper ready (${health.device})`;
@@ -134,7 +139,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     sessionsListEl.innerHTML = "";
     sessions.forEach((s) => {
-      const item = document.createElement("div");
+      const item = document.createElement("button");
+      item.type = "button";
       item.className = `session-item ${s.id === currentSessionId ? "active" : ""}`;
       item.dataset.id = s.id;
 
@@ -151,7 +157,7 @@ document.addEventListener("DOMContentLoaded", () => {
         <div class="session-item-snippet">${escapeHtml(snippet)}</div>
         <div class="session-item-meta">
           <span>${formatDate(s.updated_at)}</span>
-          <span>${duration}</span>
+          <span>${escapeHtml(s.clientId)} · ${duration}</span>
         </div>
       `;
 
@@ -165,6 +171,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Select and display a session
   async function selectSession(sessionId, scrollBottom = true) {
+    if (isRecording || btnRecord.disabled) return;
     currentSessionId = sessionId;
 
     // Highlight in sidebar
@@ -186,7 +193,7 @@ document.addEventListener("DOMContentLoaded", () => {
     sessionTitleEl.textContent = session.title;
     sessionDateEl.textContent = `Created ${formatDate(session.created_at)}`;
     sessionStatsEl.textContent = `${session.turn_count} turns • ${(session.total_audio_duration || 0).toFixed(1)}s audio`;
-    sessionClientBadgeEl.textContent = session.client_type || "web";
+    sessionClientBadgeEl.textContent = `${session.clientId} / ${session.client_type || "web"}`;
 
     // Turns
     const turns = session.turns || [];
@@ -204,7 +211,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const audioPlayerHtml = turn.audio_filename
           ? `<div class="turn-audio">
-               <audio controls preload="none" src="/api/recordings/${encodeURIComponent(turn.audio_filename)}"></audio>
+               <audio controls preload="none" src="${API.recordingUrl(turn.audio_filename)}"></audio>
              </div>`
           : "";
 
@@ -235,13 +242,18 @@ document.addEventListener("DOMContentLoaded", () => {
 
         // Card delete button
         card.querySelector(".btn-delete-turn").addEventListener("click", async () => {
-          if (confirm("Delete this turn?")) {
-            await API.deleteTurn(turn.id, true);
-            card.remove();
-            showToast("Turn deleted");
-            await selectSession(currentSessionId, false);
-            await loadSessionsList();
-          }
+          const dialog = document.getElementById("turn-delete-dialog");
+          dialog.returnValue = "cancel";
+          dialog.addEventListener("close", async () => {
+            if (dialog.returnValue !== "delete") return;
+            try {
+              await API.deleteTurn(turn.id, true);
+              showToast("Turn deleted");
+              await selectSession(currentSessionId, false);
+              await loadSessionsList();
+            } catch (err) { showToast(err.message, "danger"); }
+          }, { once: true });
+          dialog.showModal();
         });
 
         turnsContainerEl.appendChild(card);
@@ -271,6 +283,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // New Session Button
   btnNewSession.addEventListener("click", async () => {
+    if (isRecording || btnRecord.disabled) return;
     try {
       const newSession = await API.createSession("New Voice Session", "web", true);
       showToast("Session created");
@@ -342,7 +355,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Delete Session (Modal)
   btnDeleteSession.addEventListener("click", () => {
-    if (!currentSessionId) return;
+    if (!currentSessionId || isRecording || btnRecord.disabled) return;
     deleteTargetSessionId = currentSessionId;
     deleteDialog.showModal();
   });

@@ -7,6 +7,7 @@ Manages sessions, turns, and audio metadata.
 import os
 import sqlite3
 import datetime
+import uuid
 from typing import Optional, List, Dict, Any
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,13 +30,20 @@ def init_db():
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
     with get_db_connection() as conn:
         conn.executescript("""
+        CREATE TABLE IF NOT EXISTS clients (
+            clientId TEXT PRIMARY KEY,
+            clientName TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO clients (clientId, clientName) VALUES ('admin', 'Administrator');
+
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             client_type TEXT DEFAULT 'web',
-            is_active INTEGER DEFAULT 0
+            is_active INTEGER DEFAULT 0,
+            clientId TEXT NOT NULL DEFAULT 'admin' REFERENCES clients(clientId)
         );
 
         CREATE TABLE IF NOT EXISTS turns (
@@ -53,19 +61,62 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
         """)
+        # SQLite supports adding a referenced column with a NULL default only.
+        # Backfill legacy sessions in the same transaction; new inserts always supply ownership.
+        columns = {row['name'] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if 'clientId' not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN clientId TEXT REFERENCES clients(clientId)")
+            conn.execute("UPDATE sessions SET clientId = 'admin' WHERE clientId IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_client ON sessions(clientId, updated_at DESC)")
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS sessions_require_client_insert
+            BEFORE INSERT ON sessions WHEN NEW.clientId IS NULL
+            BEGIN SELECT RAISE(ABORT, 'clientId is required'); END;
+            CREATE TRIGGER IF NOT EXISTS sessions_require_client_update
+            BEFORE UPDATE OF clientId ON sessions WHEN NEW.clientId IS NULL
+            BEGIN SELECT RAISE(ABORT, 'clientId is required'); END;
+        """)
         conn.commit()
+
+
+def get_client(client_id: str) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM clients WHERE clientId = ?", (client_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_client(client_id: str, client_name: str) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        conn.execute("INSERT INTO clients (clientId, clientName) VALUES (?, ?)", (client_id, client_name))
+    return get_client(client_id)
+
+
+def list_clients(client_id: str = 'admin') -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM clients WHERE ? = 'admin' OR clientId = ? ORDER BY clientName",
+            (client_id, client_id))]
+
+
+def can_access_recording(filename: str, client_id: str) -> bool:
+    # Even admin may only stream recordings tracked by a session.
+    with get_db_connection() as conn:
+        return conn.execute("""SELECT 1 FROM turns t JOIN sessions s ON s.id = t.session_id
+            WHERE t.audio_filename = ? AND (? = 'admin' OR s.clientId = ?) LIMIT 1""",
+            (filename, client_id, client_id)).fetchone() is not None
 
 
 def generate_session_id() -> str:
     """Generates a human-friendly timestamped session ID."""
     now = datetime.datetime.now()
-    return f"ses_{now.strftime('%Y%m%d_%H%M%S')}"
+    return f"ses_{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:10]}"
 
 
 def create_session(
     title: Optional[str] = None,
     client_type: str = "web",
-    is_active: bool = False
+    is_active: bool = False,
+    client_id: str = "admin"
 ) -> Dict[str, Any]:
     """Creates a new session and returns its dict representation."""
     now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -78,26 +129,26 @@ def create_session(
 
     with get_db_connection() as conn:
         if is_active:
-            conn.execute("UPDATE sessions SET is_active = 0")
+            conn.execute("UPDATE sessions SET is_active = 0 WHERE clientId = ?", (client_id,))
         
         conn.execute(
             """
-            INSERT INTO sessions (id, title, created_at, updated_at, client_type, is_active)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (id, title, created_at, updated_at, client_type, is_active, clientId)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, title, now_iso, now_iso, client_type, 1 if is_active else 0)
+            (session_id, title, now_iso, now_iso, client_type, 1 if is_active else 0, client_id)
         )
         conn.commit()
 
-    return get_session(session_id)
+    return get_session(session_id, client_id)
 
 
-def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+def get_session(session_id: str, client_id: str = "admin") -> Optional[Dict[str, Any]]:
     """Retrieves session details and all its turns."""
     with get_db_connection() as conn:
         cur = conn.execute(
-            "SELECT id, title, created_at, updated_at, client_type, is_active FROM sessions WHERE id = ?",
-            (session_id,)
+            "SELECT * FROM sessions WHERE id = ? AND (? = 'admin' OR clientId = ?)",
+            (session_id, client_id, client_id)
         )
         row = cur.fetchone()
         if not row:
@@ -122,93 +173,52 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         return session
 
 
-def list_sessions(search: Optional[str] = None, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-    """Lists sessions ordered by updated_at with stats and last snippet."""
+def list_sessions(search: Optional[str] = None, limit: int = 50, offset: int = 0,
+                  client_id: str = "admin") -> List[Dict[str, Any]]:
+    """Filter ownership before search and pagination."""
+    query = f"%{(search or '').strip()}%"
     with get_db_connection() as conn:
-        if search and search.strip():
-            query = f"%{search.strip()}%"
-            cur = conn.execute(
-                """
-                SELECT s.id, s.title, s.created_at, s.updated_at, s.client_type, s.is_active,
-                       COUNT(t.id) AS turn_count,
-                       COALESCE(SUM(t.audio_duration), 0.0) AS total_audio_duration,
-                       (SELECT t2.transcript FROM turns t2 WHERE t2.session_id = s.id ORDER BY t2.turn_index DESC LIMIT 1) AS last_snippet
-                FROM sessions s
-                LEFT JOIN turns t ON s.id = t.session_id
-                WHERE s.title LIKE ? OR EXISTS (SELECT 1 FROM turns t3 WHERE t3.session_id = s.id AND t3.transcript LIKE ?)
-                GROUP BY s.id
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (query, query, limit, offset)
-            )
-        else:
-            cur = conn.execute(
-                """
-                SELECT s.id, s.title, s.created_at, s.updated_at, s.client_type, s.is_active,
-                       COUNT(t.id) AS turn_count,
-                       COALESCE(SUM(t.audio_duration), 0.0) AS total_audio_duration,
-                       (SELECT t2.transcript FROM turns t2 WHERE t2.session_id = s.id ORDER BY t2.turn_index DESC LIMIT 1) AS last_snippet
-                FROM sessions s
-                LEFT JOIN turns t ON s.id = t.session_id
-                GROUP BY s.id
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset)
-            )
-        
-        results = []
-        for row in cur.fetchall():
-            item = dict(row)
-            item["is_active"] = bool(item["is_active"])
-            results.append(item)
-        return results
+        rows = conn.execute("""
+            SELECT s.*, c.clientName, COUNT(t.id) AS turn_count,
+                   COALESCE(SUM(t.audio_duration), 0.0) AS total_audio_duration,
+                   (SELECT transcript FROM turns WHERE session_id = s.id
+                    ORDER BY turn_index DESC LIMIT 1) AS last_snippet
+            FROM sessions s JOIN clients c ON c.clientId = s.clientId
+            LEFT JOIN turns t ON s.id = t.session_id
+            WHERE (? = 'admin' OR s.clientId = ?)
+              AND (s.title LIKE ? OR EXISTS
+                   (SELECT 1 FROM turns WHERE session_id = s.id AND transcript LIKE ?))
+            GROUP BY s.id ORDER BY s.updated_at DESC, s.id DESC LIMIT ? OFFSET ?
+        """, (client_id, client_id, query, query, limit, offset)).fetchall()
+        return [dict(row, is_active=bool(row['is_active'])) for row in rows]
 
 
-def get_or_create_active_session() -> Dict[str, Any]:
-    """Finds the active session, or most recent session, or creates a new one."""
+def get_or_create_active_session(client_id: str = "admin") -> Dict[str, Any]:
+    """Active selection is per client, including admin's own workspace."""
     with get_db_connection() as conn:
-        cur = conn.execute("SELECT id FROM sessions WHERE is_active = 1 LIMIT 1")
-        row = cur.fetchone()
-        if row:
-            session = get_session(row["id"])
-            if session:
-                return session
-
-        # Fallback to the latest session if one exists
-        cur_latest = conn.execute("SELECT id FROM sessions ORDER BY updated_at DESC LIMIT 1")
-        row_latest = cur_latest.fetchone()
-        if row_latest:
-            session_id = row_latest["id"]
-            set_active_session(session_id)
-            return get_session(session_id)
-
-    # None exists, create a default active one
-    return create_session(title="Quick Dictation", client_type="cli", is_active=True)
+        row = conn.execute("""SELECT id FROM sessions WHERE clientId = ?
+            ORDER BY is_active DESC, updated_at DESC, id DESC LIMIT 1""", (client_id,)).fetchone()
+    if row:
+        set_active_session(row['id'], client_id)
+        return get_session(row['id'], client_id)
+    return create_session(title="Quick Dictation", client_type="cli", is_active=True, client_id=client_id)
 
 
-def set_active_session(session_id: str) -> bool:
-    """Sets the given session as active, deactivating all others."""
-    with get_db_connection() as conn:
-        cur = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
-        if not cur.fetchone():
-            return False
-        conn.execute("UPDATE sessions SET is_active = 0")
-        conn.execute("UPDATE sessions SET is_active = 1 WHERE id = ?", (session_id,))
-        conn.commit()
-        return True
+def set_active_session(session_id: str, client_id: str = "admin") -> bool:
+    return update_session(session_id, is_active=True, client_id=client_id) is not None
 
 
 def update_session(
     session_id: str,
     title: Optional[str] = None,
-    is_active: Optional[bool] = None
+    is_active: Optional[bool] = None,
+    client_id: str = "admin"
 ) -> Optional[Dict[str, Any]]:
     """Updates session title or active state."""
     with get_db_connection() as conn:
-        cur = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
-        if not cur.fetchone():
+        cur = conn.execute("SELECT clientId FROM sessions WHERE id = ? AND (? = 'admin' OR clientId = ?)", (session_id, client_id, client_id))
+        owner = cur.fetchone()
+        if not owner:
             return None
 
         now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -220,18 +230,21 @@ def update_session(
             )
         if is_active is not None:
             if is_active:
-                conn.execute("UPDATE sessions SET is_active = 0")
+                conn.execute("UPDATE sessions SET is_active = 0 WHERE clientId = ?", (owner["clientId"],))
                 conn.execute("UPDATE sessions SET is_active = 1, updated_at = ? WHERE id = ?", (now_iso, session_id))
             else:
                 conn.execute("UPDATE sessions SET is_active = 0, updated_at = ? WHERE id = ?", (now_iso, session_id))
 
         conn.commit()
-    return get_session(session_id)
+    return get_session(session_id, client_id)
 
 
-def delete_session(session_id: str, delete_audio: bool = True) -> bool:
+def delete_session(session_id: str, delete_audio: bool = True, client_id: str = "admin") -> bool:
     """Deletes a session, its turns, and optionally its audio recordings."""
     with get_db_connection() as conn:
+        if not conn.execute("SELECT 1 FROM sessions WHERE id = ? AND (? = 'admin' OR clientId = ?)",
+                            (session_id, client_id, client_id)).fetchone():
+            return False
         cur = conn.execute("SELECT audio_filename FROM turns WHERE session_id = ?", (session_id,))
         turn_audios = [r["audio_filename"] for r in cur.fetchall() if r["audio_filename"]]
 
@@ -256,19 +269,21 @@ def add_turn(
     transcript: str,
     audio_filename: Optional[str] = None,
     audio_duration: float = 0.0,
-    infer_duration: float = 0.0
+    infer_duration: float = 0.0,
+    client_id: str = "admin"
 ) -> Dict[str, Any]:
     """Adds a turn to a session. Auto-generates title if initial default session title."""
     transcript = transcript.strip()
     now_iso = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with get_db_connection() as conn:
-        # Verify or auto-create session
-        cur = conn.execute("SELECT id, title FROM sessions WHERE id = ?", (session_id,))
-        sess_row = cur.fetchone()
+        # Serialize index allocation across clients writing to this session.
+        conn.execute("BEGIN IMMEDIATE")
+        sess_row = conn.execute(
+            "SELECT id, title FROM sessions WHERE id = ? AND (? = 'admin' OR clientId = ?)",
+            (session_id, client_id, client_id)).fetchone()
         if not sess_row:
-            create_session(title=f"Session {datetime.datetime.now().strftime('%b %d, %H:%M')}", is_active=True)
-            sess_row = conn.execute("SELECT id, title FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            raise ValueError("Session not found")
 
         # Determine turn index
         cur_idx = conn.execute(
@@ -318,10 +333,11 @@ def add_turn(
         return dict(cur_turn.fetchone())
 
 
-def delete_turn(turn_id: int, delete_audio: bool = True) -> bool:
+def delete_turn(turn_id: int, delete_audio: bool = True, client_id: str = "admin") -> bool:
     """Deletes a single turn and optionally its audio file."""
     with get_db_connection() as conn:
-        cur = conn.execute("SELECT session_id, audio_filename FROM turns WHERE id = ?", (turn_id,))
+        cur = conn.execute("""SELECT t.session_id, t.audio_filename FROM turns t JOIN sessions s ON s.id = t.session_id
+            WHERE t.id = ? AND (? = 'admin' OR s.clientId = ?)""", (turn_id, client_id, client_id))
         row = cur.fetchone()
         if not row:
             return False
@@ -343,12 +359,12 @@ def delete_turn(turn_id: int, delete_audio: bool = True) -> bool:
     return True
 
 
-def get_session_raw_text(session_id: str, format_type: str = "plain") -> str:
+def get_session_raw_text(session_id: str, format_type: str = "plain", client_id: str = "admin") -> str:
     """
     Returns full conversation text ready for 1-click clipboard copying.
     format_type can be 'plain' or 'markdown'.
     """
-    session = get_session(session_id)
+    session = get_session(session_id, client_id)
     if not session or not session.get("turns"):
         return ""
 

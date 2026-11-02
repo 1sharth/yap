@@ -38,6 +38,7 @@ DIM = "\033[2m"
 RESET = "\033[0m"
 
 DAEMON_URL = "http://127.0.0.1:28473"
+CLIENT_ID = os.environ.get("YAP_CLIENT_ID", "admin")
 
 
 def load_env_file(path: str):
@@ -168,7 +169,7 @@ def ensure_daemon_running() -> bool:
 # -------------------------------------------------------------
 def api_get_active_session() -> Optional[Dict[str, Any]]:
     try:
-        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions/active")
+        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions/active", headers={"X-Client-Id": CLIENT_ID})
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
@@ -181,7 +182,7 @@ def api_create_session(title: str) -> Optional[Dict[str, Any]]:
         req = urllib.request.Request(
             f"{DAEMON_URL}/api/sessions",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Client-Id": CLIENT_ID},
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=2.0) as resp:
@@ -192,7 +193,7 @@ def api_create_session(title: str) -> Optional[Dict[str, Any]]:
 
 def api_get_session(session_id: str) -> Optional[Dict[str, Any]]:
     try:
-        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions/{session_id}")
+        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions/{session_id}", headers={"X-Client-Id": CLIENT_ID})
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
@@ -201,7 +202,7 @@ def api_get_session(session_id: str) -> Optional[Dict[str, Any]]:
 
 def api_list_sessions() -> list:
     try:
-        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions?limit=10")
+        req = urllib.request.Request(f"{DAEMON_URL}/api/sessions?limit=10", headers={"X-Client-Id": CLIENT_ID})
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
@@ -214,7 +215,7 @@ def api_session_transcribe(session_id: str, wav_path: str) -> Dict[str, Any]:
     req = urllib.request.Request(
         f"{DAEMON_URL}/api/sessions/{session_id}/transcribe",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Client-Id": CLIENT_ID},
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -227,7 +228,7 @@ def transcribe_fallback_daemon(wav_path: str) -> str:
     req = urllib.request.Request(
         f"{DAEMON_URL}/transcribe",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Client-Id": CLIENT_ID},
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -381,6 +382,7 @@ def run_single_yap(
 
 
 def main():
+    global CLIENT_ID
     parser = argparse.ArgumentParser(description="Yap — Faster-Whisper GPU Dictation & Conversations")
     parser.add_argument("-n", "--new", type=str, metavar="TITLE", help="Start a new named session")
     parser.add_argument("-s", "--session", type=str, metavar="ID", help="Attach to a specific session ID")
@@ -388,6 +390,7 @@ def main():
     args = parser.parse_args()
 
     load_env_file(os.path.join(PROJECT_DIR, ".env"))
+    CLIENT_ID = os.environ.get("YAP_CLIENT_ID", "admin")
     load_env_file("/mnt/NewVolume/obsidian_data/40_Research/learning_tool/.env")
     load_env_file("/mnt/NewVolume/obsidian_data/40_Research/learning_tool/learnharness/.env.local")
 

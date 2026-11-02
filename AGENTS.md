@@ -14,3 +14,18 @@ When making any frontend or design modifications to this repository:
    - Audio recordings are saved in `recordings/` as 16 kHz Mono WAV.
    - Database operations stay in `db.py` (SQLite WAL mode).
    - CLI dictation stays fast in `dictate.py`.
+
+## Approved shared brand
+
+For this requested redesign, `../BRAND_UI_UX.md` supersedes the older obsidian-only
+palette above and the skill's palette/font defaults. Yap's signature accent is **ink blue**
+(`#284B9F` light / `#A9BCF2` dark). Preserve warm light/dark surfaces, System/Light/Dark
+selection, Geist UI, Geist Mono metadata, and Newsreader reading text with fallbacks.
+
+## Local identity / deployment blocker
+
+Client IDs are deliberately caller-supplied for local use. Anyone sending `admin` can
+access all clients' data. **Before deploying or exposing Yap beyond localhost, replace
+this with real authentication and server-side authorization.** Also review filesystem
+path transcription, CORS, shutdown, and the shared transcript backup. Do not describe
+client ID filtering as authentication or deployment-ready tenant isolation.

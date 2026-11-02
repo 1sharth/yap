@@ -15,6 +15,8 @@ import subprocess
 import wave
 import shutil
 import tempfile
+import sqlite3
+import uuid
 from typing import Optional
 
 HOST = "127.0.0.1"
@@ -48,11 +50,11 @@ def _preload_nvidia_libs():
 _preload_nvidia_libs()
 from faster_whisper import WhisperModel
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, status
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, status, Header, Depends
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db
 
@@ -126,6 +128,43 @@ def transcribe_wav(wav_path: str) -> tuple[str, float]:
     return text, round(duration, 3)
 
 
+def request_client(
+    header: Optional[str] = Header(None, alias="X-Client-Id"),
+    query: Optional[str] = Query(None, alias="clientId"),
+) -> str:
+    """Local identity selector only, NOT authentication. Never deploy as-is."""
+    if header is not None and query is not None and header != query:
+        raise HTTPException(400, "Conflicting client IDs")
+    client_id = header if header is not None else query
+    if not client_id:
+        raise HTTPException(400, "Provide X-Client-Id or clientId")
+    if not db.get_client(client_id):
+        raise HTTPException(403, "Unknown client ID")
+    return client_id
+
+
+def admin_client(client_id: str = Depends(request_client)) -> str:
+    if client_id != "admin":
+        raise HTTPException(403, "Admin client required")
+    return client_id
+
+
+def require_session(session_id: str, client_id: str):
+    session = db.get_session(session_id, client_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return session
+
+
+def require_local_input(wav_path: str, client_id: str):
+    # Existing archived audio cannot be read across clients via path transcription.
+    real_path = os.path.realpath(wav_path)
+    archive = os.path.realpath(RECORDINGS_DIR)
+    if os.path.commonpath([real_path, archive]) == archive:
+        if os.path.dirname(real_path) != archive or not db.can_access_recording(os.path.basename(real_path), client_id):
+            raise HTTPException(404, "Recording not found")
+
+
 # Request schemas
 class LegacyTranscribeRequest(BaseModel):
     wav_path: str
@@ -163,7 +202,7 @@ def health():
 
 
 @app.post("/transcribe")
-def legacy_transcribe(req: LegacyTranscribeRequest):
+def legacy_transcribe(req: LegacyTranscribeRequest, client_id: str = Depends(admin_client)):
     """Preserves 100% backward compatibility with legacy scripts."""
     if not os.path.exists(req.wav_path):
         raise HTTPException(status_code=400, detail="WAV file not found")
@@ -175,7 +214,7 @@ def legacy_transcribe(req: LegacyTranscribeRequest):
 
 
 @app.post("/shutdown")
-def shutdown():
+def shutdown(client_id: str = Depends(admin_client)):
     def _do_shutdown():
         time.sleep(0.5)
         os._exit(0)
@@ -186,12 +225,34 @@ def shutdown():
 # -------------------------------------------------------------
 # Session Management Endpoints
 # -------------------------------------------------------------
+class ClientCreateRequest(BaseModel):
+    clientId: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.-]+$")
+    clientName: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/api/clients", status_code=201)
+def create_client_endpoint(req: ClientCreateRequest, client_id: str = Depends(admin_client)):
+    name = req.clientName.strip()
+    if not name:
+        raise HTTPException(422, "Client name cannot be blank")
+    try:
+        return db.create_client(req.clientId, name)
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Client ID already exists")
+
+
+@app.get("/api/clients")
+def list_clients_endpoint(client_id: str = Depends(request_client)):
+    return db.list_clients(client_id)
+
+
 @app.post("/api/sessions")
-def create_session_endpoint(req: SessionCreateRequest):
+def create_session_endpoint(req: SessionCreateRequest, client_id: str = Depends(request_client)):
     session = db.create_session(
         title=req.title,
         client_type=req.client_type,
-        is_active=req.is_active
+        is_active=req.is_active,
+        client_id=client_id
     )
     return session
 
@@ -200,50 +261,52 @@ def create_session_endpoint(req: SessionCreateRequest):
 def list_sessions_endpoint(
     search: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0)
+    offset: int = Query(0, ge=0),
+    client_id: str = Depends(request_client)
 ):
-    return db.list_sessions(search=search, limit=limit, offset=offset)
+    return db.list_sessions(search=search, limit=limit, offset=offset, client_id=client_id)
 
 
 @app.get("/api/sessions/active")
-def get_active_session_endpoint():
-    return db.get_or_create_active_session()
+def get_active_session_endpoint(client_id: str = Depends(request_client)):
+    return db.get_or_create_active_session(client_id)
 
 
 @app.get("/api/sessions/{session_id}")
-def get_session_endpoint(session_id: str):
-    session = db.get_session(session_id)
+def get_session_endpoint(session_id: str, client_id: str = Depends(request_client)):
+    session = db.get_session(session_id, client_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
 
 @app.patch("/api/sessions/{session_id}")
-def update_session_endpoint(session_id: str, req: SessionUpdateRequest):
-    session = db.update_session(session_id, title=req.title, is_active=req.is_active)
+def update_session_endpoint(session_id: str, req: SessionUpdateRequest, client_id: str = Depends(request_client)):
+    session = db.update_session(session_id, title=req.title, is_active=req.is_active, client_id=client_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
 
 
 @app.delete("/api/sessions/{session_id}")
-def delete_session_endpoint(session_id: str, delete_audio: bool = Query(True)):
-    deleted = db.delete_session(session_id, delete_audio=delete_audio)
+def delete_session_endpoint(session_id: str, delete_audio: bool = Query(True), client_id: str = Depends(request_client)):
+    deleted = db.delete_session(session_id, delete_audio=delete_audio, client_id=client_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"deleted": True, "session_id": session_id}
 
 
 @app.get("/api/sessions/{session_id}/raw")
-def get_raw_session_text(session_id: str, format: str = Query("plain")):
+def get_raw_session_text(session_id: str, format: str = Query("plain"), client_id: str = Depends(request_client)):
     """Returns conversation text formatted for easy 1-click clipboard copying."""
-    text = db.get_session_raw_text(session_id, format_type=format)
+    require_session(session_id, client_id)
+    text = db.get_session_raw_text(session_id, format_type=format, client_id=client_id)
     return PlainTextResponse(text)
 
 
 @app.delete("/api/turns/{turn_id}")
-def delete_turn_endpoint(turn_id: int, delete_audio: bool = Query(True)):
-    deleted = db.delete_turn(turn_id, delete_audio=delete_audio)
+def delete_turn_endpoint(turn_id: int, delete_audio: bool = Query(True), client_id: str = Depends(request_client)):
+    deleted = db.delete_turn(turn_id, delete_audio=delete_audio, client_id=client_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Turn not found")
     return {"deleted": True, "turn_id": turn_id}
@@ -253,12 +316,14 @@ def delete_turn_endpoint(turn_id: int, delete_audio: bool = Query(True)):
 # Transcription & Recording Endpoints
 # -------------------------------------------------------------
 @app.post("/api/sessions/{session_id}/transcribe")
-async def session_transcribe_local_path(session_id: str, req: LocalTranscribeRequest):
+async def session_transcribe_local_path(session_id: str, req: LocalTranscribeRequest, client_id: str = Depends(request_client)):
     """
     Zero-copy local path transcription (used by terminal CLI for maximum speed).
     Expects JSON: {"wav_path": "/path/to/wav"}
     """
+    require_session(session_id, client_id)
     wav_path = req.wav_path
+    require_local_input(wav_path, client_id)
     if not os.path.exists(wav_path):
         raise HTTPException(status_code=400, detail="WAV file not found")
 
@@ -268,30 +333,39 @@ async def session_transcribe_local_path(session_id: str, req: LocalTranscribeReq
 
     # Store WAV into recordings directory
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
-    timestamp_slug = time.strftime("%Y-%m-%d_%H-%M-%S")
-    saved_filename = f"{timestamp_slug}.wav"
+    saved_filename = f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}.wav"
     saved_path = os.path.join(RECORDINGS_DIR, saved_filename)
-    counter = 1
-    while os.path.exists(saved_path):
-        saved_filename = f"{timestamp_slug}_{counter}.wav"
-        saved_path = os.path.join(RECORDINGS_DIR, saved_filename)
-        counter += 1
-
+    # Keep the local fast path for the CLI's already-normalized WAV.
     try:
+        with wave.open(wav_path, "rb") as audio:
+            normalized = (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (16000, 1, 2)
+    except (wave.Error, EOFError):
+        normalized = False
+    if normalized:
         shutil.copy2(wav_path, saved_path)
+    else:
+        result = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav_path,
+                                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", saved_path],
+                                capture_output=True)
+        if result.returncode:
+            if os.path.exists(saved_path):
+                os.remove(saved_path)
+            raise HTTPException(400, "Audio conversion failed")
+    audio_dur = get_audio_duration(saved_path)
+
+    # A session might be deleted while inference is running.
+    try:
+        turn = db.add_turn(
+            session_id=session_id,
+            transcript=text,
+            audio_filename=saved_filename,
+            audio_duration=audio_dur,
+            infer_duration=infer_time,
+            client_id=client_id
+        )
     except Exception:
-        saved_filename = None
-
-    audio_dur = get_audio_duration(saved_path) if saved_path and os.path.exists(saved_path) else 0.0
-
-    # Save to database
-    turn = db.add_turn(
-        session_id=session_id,
-        transcript=text,
-        audio_filename=saved_filename,
-        audio_duration=audio_dur,
-        infer_duration=infer_time
-    )
+        os.remove(saved_path)
+        raise
 
     # Append to thinking.txt
     rel_audio = f"recordings/{saved_filename}" if saved_filename else None
@@ -308,18 +382,14 @@ async def session_transcribe_local_path(session_id: str, req: LocalTranscribeReq
 @app.post("/api/sessions/{session_id}/upload")
 async def session_transcribe_upload(
     session_id: str,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    client_id: str = Depends(request_client)
 ):
     """
     Multipart audio file upload (used by Web Portal browser mic recording or remote clients).
     Accepts webm, wav, ogg, etc. Converts to 16 kHz Mono WAV using ffmpeg.
     """
-    # Verify session exists
-    session = db.get_session(session_id)
-    if not session:
-        # Auto-create if not found
-        session = db.create_session(title=f"Web Session {time.strftime('%b %d, %H:%M')}", client_type="web", is_active=True)
-        session_id = session["id"]
+    require_session(session_id, client_id)
 
     # Write upload to temp file
     suffix = os.path.splitext(file.filename or "")[1] or ".webm"
@@ -328,33 +398,27 @@ async def session_transcribe_upload(
         content = await file.read()
         tmp_in.write(content)
 
-    converted_wav_path = None
+    saved_path = None
+    persisted = False
     try:
         # Target destination in recordings/
         os.makedirs(RECORDINGS_DIR, exist_ok=True)
-        timestamp_slug = time.strftime("%Y-%m-%d_%H-%M-%S")
-        saved_filename = f"{timestamp_slug}.wav"
+        saved_filename = f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{uuid.uuid4().hex}.wav"
         saved_path = os.path.join(RECORDINGS_DIR, saved_filename)
-        counter = 1
-        while os.path.exists(saved_path):
-            saved_filename = f"{timestamp_slug}_{counter}.wav"
-            saved_path = os.path.join(RECORDINGS_DIR, saved_filename)
-            counter += 1
 
         # Convert to 16 kHz Mono WAV via ffmpeg
         conv_cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-i", tmp_in_path,
-            "-ar", "16000", "-ac", "1",
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
             saved_path
         ]
         res = subprocess.run(conv_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if res.returncode != 0 or not os.path.exists(saved_path):
             raise HTTPException(status_code=400, detail=f"Audio conversion failed: {res.stderr.decode('utf-8', errors='ignore')}")
 
-        converted_wav_path = saved_path
-        text, infer_time = transcribe_wav(converted_wav_path)
-        audio_dur = get_audio_duration(converted_wav_path)
+        text, infer_time = transcribe_wav(saved_path)
+        audio_dur = get_audio_duration(saved_path)
 
         # Save to database
         turn = db.add_turn(
@@ -362,8 +426,11 @@ async def session_transcribe_upload(
             transcript=text,
             audio_filename=saved_filename,
             audio_duration=audio_dur,
-            infer_duration=infer_time
+            infer_duration=infer_time,
+            client_id=client_id
         )
+
+        persisted = True
 
         # Append to thinking.txt
         append_to_thinking_log(text, f"recordings/{saved_filename}")
@@ -375,6 +442,8 @@ async def session_transcribe_upload(
             "audio_duration": audio_dur
         }
     finally:
+        if not persisted and saved_path and os.path.exists(saved_path):
+            os.remove(saved_path)
         if os.path.exists(tmp_in_path):
             try:
                 os.remove(tmp_in_path)
@@ -386,8 +455,10 @@ async def session_transcribe_upload(
 # Audio Playback & Streaming
 # -------------------------------------------------------------
 @app.api_route("/api/recordings/{filename}", methods=["GET", "HEAD"])
-def stream_recording(filename: str):
+def stream_recording(filename: str, client_id: str = Depends(request_client)):
     """Streams audio file with native HTTP Range support for browser scrubbing."""
+    if filename != os.path.basename(filename) or not db.can_access_recording(filename, client_id):
+        raise HTTPException(404, "Recording not found")
     safe_filename = os.path.basename(filename)
     file_path = os.path.join(RECORDINGS_DIR, safe_filename)
     if not os.path.exists(file_path):
